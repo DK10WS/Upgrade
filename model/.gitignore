@@ -1,0 +1,6 @@
+genres_matrix.pkl
+tags_matrix.pkl
+summary_matrix.pkl
+content_similarity.pkl
+user_factors.pkl
+movie_factors.pkl
