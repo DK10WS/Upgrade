@@ -3,90 +3,131 @@ import pickle
 
 import numpy as np
 import pandas as pd
+from scipy.sparse import hstack
+from sentence_transformers import SentenceTransformer
 from sklearn.decomposition import TruncatedSVD
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import MultiLabelBinarizer
 
-df = pd.read_csv("Final_data.csv")
 
-df["genres"] = df["genres"].fillna("").str.split(",")
-df["tags"] = df["tags"].fillna("").str.split(",")
+class HybridRecommender:
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        cache_dir: str = ".",
+        n_components: int = 50,
+        n_collab_samples: int = 100,
+        use_collaborative: bool = True,
+    ):
+        self.df = df.copy()
+        self.cache_dir = cache_dir
+        self.n_components = n_components
+        self.n_collab_samples = n_collab_samples
+        self.use_collaborative = use_collaborative
 
-mlb_genres = MultiLabelBinarizer()
-mlb_tags = MultiLabelBinarizer()
+        self.df["genres"] = self.df["genres"].fillna("").str.split(",")
+        self.df["tags"] = self.df["tags"].fillna("").str.split(",")
 
-genre_matrix_file = "genres_matrix.pkl"
-tag_matrix_file = "tags_matrix.pkl"
-summary_matrix_file = "summary_matrix.pkl"
-content_similarity_file = "content_similarity.pkl"
-user_factors_file = "user_factors.pkl"
-movie_factors_file = "movie_factors.pkl"
+        self._load_or_build("mlb_genres.pkl", self._build_mlb, "genres")
+        self._load_or_build("mlb_tags.pkl", self._build_mlb, "tags")
+        self._load_or_build(
+            "summary_embeddings.npy", self._build_embeddings, None, is_numpy=True
+        )
+        self._load_or_build("content_mat.pkl", self._build_content, None)
+
+        if self.use_collaborative:
+            self._load_or_build("svd.pkl", self._build_svd, None)
+            self._load_or_build(
+                "user_factors.npy", self._build_factors, "users", is_numpy=True
+            )
+            self._load_or_build(
+                "movie_factors.npy", self._build_factors, "movies", is_numpy=True
+            )
+
+    def _load_or_build(self, fname, build_fn, arg, is_numpy=False):
+        path = os.path.join(self.cache_dir, fname)
+        name = fname.split(".")[0]
+
+        if os.path.exists(path):
+            if is_numpy:
+                setattr(self, name, np.load(path, allow_pickle=True))
+            else:
+                setattr(self, name, pickle.load(open(path, "rb")))
+        else:
+            obj = build_fn(arg)
+            if is_numpy:
+                np.save(path, obj)
+            else:
+                with open(path, "wb") as f:
+                    pickle.dump(obj, f)
+            setattr(self, name, obj)
+
+    def _build_mlb(self, column):
+        mlb = MultiLabelBinarizer(sparse_output=True)
+        mat = mlb.fit_transform(self.df[column])
+        setattr(self, f"{column}_mat", mat)
+        return mlb
+
+    def _build_embeddings(self, _):
+        print("🔍 Generating sentence embeddings...")
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        summaries = self.df["summary"].fillna("").tolist()
+        embeddings = model.encode(summaries, show_progress_bar=True)
+        return np.array(embeddings)
+
+    def _build_content(self, _):
+        return hstack([self.genres_mat, self.tags_mat]).tocsr()
+
+    def _build_svd(self, _):
+        user_movie = np.random.rand(self.n_collab_samples, len(self.df))
+        svd = TruncatedSVD(self.n_components)
+        svd.fit(user_movie)
+        return svd
+
+    def _build_factors(self, which):
+        user_movie = np.random.rand(self.n_collab_samples, len(self.df))
+        if which == "users":
+            return self.svd.transform(user_movie)
+        else:
+            return self.svd.components_.T
+
+    def get_hybrid_recommendations(
+        self,
+        user_id: int,
+        movie_id: int,
+        content_weight: float = 0.5,
+        collaborative_weight: float = 0.5,
+        top_k: int = 30,
+        return_scores: bool = False,
+    ):
+        if not self.use_collaborative:
+            collaborative_weight = 0.0
+            content_weight = 1.0
+
+        if collaborative_weight > 0:
+            collab_scores = self.movie_factors.dot(self.user_factors[user_id])
+        else:
+            collab_scores = np.zeros(len(self.df))
+
+        movie_vec = self.summary_embeddings[movie_id].reshape(1, -1)
+        content_scores = cosine_similarity(
+            movie_vec, self.summary_embeddings).ravel()
+
+        hybrid = content_weight * content_scores + collaborative_weight * collab_scores
+
+        idx = np.argpartition(-hybrid, top_k)[:top_k]
+        best_idx = idx[np.argsort(-hybrid[idx])]
+
+        if return_scores:
+            return list(zip(self.df["title"].iloc[best_idx], hybrid[best_idx]))
+        return self.df["title"].iloc[best_idx].tolist()
 
 
-def save_with_pickle(data, filename):
-    with open(filename, "wb") as file:
-        pickle.dump(data, file)
+if __name__ == "__main__":
+    df = pd.read_csv("Final_data.csv")
+    rec = HybridRecommender(df, cache_dir=".", use_collaborative=True)
 
-
-def load_with_pickle(filename):
-    with open(filename, "rb") as file:
-        return pickle.load(file)
-
-
-if os.path.exists(genre_matrix_file):
-    genres_matrix = load_with_pickle(genre_matrix_file)
-else:
-    genres_matrix = mlb_genres.fit_transform(df["genres"])
-    save_with_pickle(genres_matrix, genre_matrix_file)
-
-if os.path.exists(tag_matrix_file):
-    tags_matrix = load_with_pickle(tag_matrix_file)
-else:
-    tags_matrix = mlb_tags.fit_transform(df["tags"])
-    save_with_pickle(tags_matrix, tag_matrix_file)
-
-tfidf = TfidfVectorizer(stop_words="english")
-if os.path.exists(summary_matrix_file):
-    summary_matrix = load_with_pickle(summary_matrix_file)
-else:
-    summary_matrix = tfidf.fit_transform(df["summary"].fillna(""))
-    save_with_pickle(summary_matrix, summary_matrix_file)
-
-if os.path.exists(content_similarity_file):
-    content_similarity = load_with_pickle(content_similarity_file)
-else:
-    content_matrix = np.hstack((genres_matrix, tags_matrix, summary_matrix.toarray()))
-    content_similarity = cosine_similarity(content_matrix, content_matrix)
-    save_with_pickle(content_similarity, content_similarity_file)
-
-if os.path.exists(user_factors_file) and os.path.exists(movie_factors_file):
-    user_factors = load_with_pickle(user_factors_file)
-    movie_factors = load_with_pickle(movie_factors_file)
-else:
-    user_movie_matrix = np.random.rand(100, len(df))
-    svd = TruncatedSVD(n_components=50)
-    user_factors = svd.fit_transform(user_movie_matrix)
-    movie_factors = svd.components_.T
-    save_with_pickle(user_factors, user_factors_file)
-    save_with_pickle(movie_factors, movie_factors_file)
-
-
-def get_hybrid_recommendations(
-    user_id, movie_id, content_weight=0.5, collaborative_weight=0.5
-):
-    collaborative_score = np.dot(user_factors[user_id], movie_factors[movie_id])
-
-    content_score = content_similarity[movie_id]
-
-    hybrid_scores = (content_weight * content_score) + (
-        collaborative_weight * collaborative_score
-    )
-
-    recommended_indices = hybrid_scores.argsort()[::-1][:30]
-    return df["title"].iloc[recommended_indices]
-
-
-user_id = 0
-movie_id = 6838
-print(get_hybrid_recommendations(user_id, movie_id))
+    for title, score in rec.get_hybrid_recommendations(
+        user_id=0, movie_id=0, return_scores=True
+    ):
+        print(f"{title:60}  Score: {score:.4f}")
