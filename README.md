@@ -2,14 +2,14 @@
 
 - [ ] Make frontend and backend
 - [ ] Find a better movie search system
-- [ ] Make model faster
-- [ ] Add feature to store vectorized values
+- [x] Make model faster
+- [x] Add feature to store vectorized values
 
 
 
 ```bash
 cd spider
-scrapy crawl moviebot
+scrapy crawl moviebot -o output/movies.csv
 ```
 
 ```bash
