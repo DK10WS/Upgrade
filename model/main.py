@@ -1,133 +1,74 @@
 import os
-import pickle
-
 import numpy as np
 import pandas as pd
-from scipy.sparse import hstack
-from sentence_transformers import SentenceTransformer
-from sklearn.decomposition import TruncatedSVD
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import MultiLabelBinarizer
+from sentence_transformers import SentenceTransformer
 
 
-class HybridRecommender:
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        cache_dir: str = ".",
-        n_components: int = 50,
-        n_collab_samples: int = 100,
-        use_collaborative: bool = True,
-    ):
+class MovieRecommender:
+    def __init__(self, df: pd.DataFrame, cache_dir: str = ".cache", model_name="all-mpnet-base-v2"):
+        os.makedirs(cache_dir, exist_ok=True)
         self.df = df.copy()
         self.cache_dir = cache_dir
-        self.n_components = n_components
-        self.n_collab_samples = n_collab_samples
-        self.use_collaborative = use_collaborative
+        self.model = SentenceTransformer(model_name)
 
-        self.df["genres"] = self.df["genres"].fillna("").str.split(",")
-        self.df["tags"] = self.df["tags"].fillna("").str.split(",")
+        self._prepare_data()
+        self._load_or_compute_embeddings()
 
-        self._load_or_build("mlb_genres.pkl", self._build_mlb, "genres")
-        self._load_or_build("mlb_tags.pkl", self._build_mlb, "tags")
-        self._load_or_build(
-            "summary_embeddings.npy", self._build_embeddings, None, is_numpy=True
+    def _prepare_data(self):
+        def safe_split(x):
+            if pd.isna(x):
+                return []
+            return [i.strip() for i in x.split(",")]
+
+        self.df["genres"] = self.df["genres"].apply(safe_split)
+        self.df["sub_genres"] = self.df["sub_genres"].apply(safe_split)
+        self.df["tags"] = self.df["tags"].apply(safe_split)
+
+        self.df["release_year"] = pd.to_datetime(self.df["release_date"], errors="coerce").dt.year.fillna(0).astype(int)
+        self.df["summary"] = self.df["summary"].fillna("")
+
+        self.df["text_for_embedding"] = (
+            self.df["title"].fillna("") + ". " +
+            self.df["summary"] + ". " +
+            self.df["genres"].apply(lambda x: ", ".join(x)) + ". " +
+            self.df["sub_genres"].apply(lambda x: ", ".join(x)) + ". " +
+            self.df["tags"].apply(lambda x: ", ".join(x)) + ". " +
+            self.df["release_year"].astype(str)
         )
-        self._load_or_build("content_mat.pkl", self._build_content, None)
 
-        if self.use_collaborative:
-            self._load_or_build("svd.pkl", self._build_svd, None)
-            self._load_or_build(
-                "user_factors.npy", self._build_factors, "users", is_numpy=True
+    def _load_or_compute_embeddings(self):
+        emb_path = os.path.join(self.cache_dir, "movie_embeddings.npy")
+        if os.path.exists(emb_path):
+            self.embeddings = np.load(emb_path)
+        else:
+            self.embeddings = self.model.encode(
+                self.df["text_for_embedding"].tolist(),
+                show_progress_bar=True,
+                convert_to_numpy=True,
+                normalize_embeddings=True
             )
-            self._load_or_build(
-                "movie_factors.npy", self._build_factors, "movies", is_numpy=True
-            )
+            np.save(emb_path, self.embeddings)
 
-    def _load_or_build(self, fname, build_fn, arg, is_numpy=False):
-        path = os.path.join(self.cache_dir, fname)
-        name = fname.split(".")[0]
+    def recommend(self, movie_title, top_k=10):
+        if movie_title not in self.df["title"].values:
+            raise ValueError(f"Movie '{movie_title}' not found in dataset.")
 
-        if os.path.exists(path):
-            if is_numpy:
-                setattr(self, name, np.load(path, allow_pickle=True))
-            else:
-                setattr(self, name, pickle.load(open(path, "rb")))
-        else:
-            obj = build_fn(arg)
-            if is_numpy:
-                np.save(path, obj)
-            else:
-                with open(path, "wb") as f:
-                    pickle.dump(obj, f)
-            setattr(self, name, obj)
+        idx = self.df.index[self.df["title"] == movie_title][0]
+        query_vec = self.embeddings[idx].reshape(1, -1)
+        scores = cosine_similarity(query_vec, self.embeddings).ravel()
 
-    def _build_mlb(self, column):
-        mlb = MultiLabelBinarizer(sparse_output=True)
-        mat = mlb.fit_transform(self.df[column])
-        setattr(self, f"{column}_mat", mat)
-        return mlb
+        top_indices = scores.argsort()[::-1][1: top_k + 1]
+        recommendations = self.df.loc[top_indices, "title"].tolist()
+        scores = scores[top_indices]
 
-    def _build_embeddings(self, _):
-        print("🔍 Generating sentence embeddings...")
-        model = SentenceTransformer("all-MiniLM-L6-v2")
-        summaries = self.df["summary"].fillna("").tolist()
-        embeddings = model.encode(summaries, show_progress_bar=True)
-        return np.array(embeddings)
-
-    def _build_content(self, _):
-        return hstack([self.genres_mat, self.tags_mat]).tocsr()
-
-    def _build_svd(self, _):
-        user_movie = np.random.rand(self.n_collab_samples, len(self.df))
-        svd = TruncatedSVD(self.n_components)
-        svd.fit(user_movie)
-        return svd
-
-    def _build_factors(self, which):
-        user_movie = np.random.rand(self.n_collab_samples, len(self.df))
-        if which == "users":
-            return self.svd.transform(user_movie)
-        else:
-            return self.svd.components_.T
-
-    def get_hybrid_recommendations(
-        self,
-        user_id: int,
-        movie_id: int,
-        content_weight: float = 0.5,
-        collaborative_weight: float = 0.5,
-        top_k: int = 30,
-        return_scores: bool = False,
-    ):
-        if not self.use_collaborative:
-            collaborative_weight = 0.0
-            content_weight = 1.0
-
-        if collaborative_weight > 0:
-            collab_scores = self.movie_factors.dot(self.user_factors[user_id])
-        else:
-            collab_scores = np.zeros(len(self.df))
-
-        movie_vec = self.summary_embeddings[movie_id].reshape(1, -1)
-        content_scores = cosine_similarity(
-            movie_vec, self.summary_embeddings).ravel()
-
-        hybrid = content_weight * content_scores + collaborative_weight * collab_scores
-
-        idx = np.argpartition(-hybrid, top_k)[:top_k]
-        best_idx = idx[np.argsort(-hybrid[idx])]
-
-        if return_scores:
-            return list(zip(self.df["title"].iloc[best_idx], hybrid[best_idx]))
-        return self.df["title"].iloc[best_idx].tolist()
+        return list(zip(recommendations, scores))
 
 
 if __name__ == "__main__":
-    df = pd.read_csv("Final_data.csv")
-    rec = HybridRecommender(df, cache_dir=".", use_collaborative=True)
+    df = pd.read_csv("movies.csv")
+    recommender = MovieRecommender(df)
 
-    for title, score in rec.get_hybrid_recommendations(
-        user_id=0, movie_id=0, return_scores=True
-    ):
+    movie = "Schindler's List"
+    for title, score in recommender.recommend(movie, top_k=20):
         print(f"{title:60}  Score: {score:.4f}")
