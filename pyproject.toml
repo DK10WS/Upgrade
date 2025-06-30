@@ -6,5 +6,6 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "scipy>=1.16.0",
+    "scrapy>=2.13.2",
     "sentence-transformers>=4.1.0",
 ]
