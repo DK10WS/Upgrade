@@ -1,12 +1,21 @@
 import os
+
 import numpy as np
 import pandas as pd
-from sklearn.metrics.pairwise import cosine_similarity
+from fastapi import APIRouter, HTTPException, Query
 from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+
+app = APIRouter()
 
 
 class MovieRecommender:
-    def __init__(self, df: pd.DataFrame, cache_dir: str = ".cache", model_name="all-mpnet-base-v2"):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        cache_dir: str = ".cache",
+        model_name="all-mpnet-base-v2",
+    ):
         os.makedirs(cache_dir, exist_ok=True)
         self.df = df.copy()
         self.cache_dir = cache_dir
@@ -25,16 +34,25 @@ class MovieRecommender:
         self.df["sub_genres"] = self.df["sub_genres"].apply(safe_split)
         self.df["tags"] = self.df["tags"].apply(safe_split)
 
-        self.df["release_year"] = pd.to_datetime(self.df["release_date"], errors="coerce").dt.year.fillna(0).astype(int)
+        self.df["release_year"] = (
+            pd.to_datetime(self.df["release_date"], errors="coerce")
+            .dt.year.fillna(0)
+            .astype(int)
+        )
         self.df["summary"] = self.df["summary"].fillna("")
 
         self.df["text_for_embedding"] = (
-            self.df["title"].fillna("") + ". " +
-            self.df["summary"] + ". " +
-            self.df["genres"].apply(lambda x: ", ".join(x)) + ". " +
-            self.df["sub_genres"].apply(lambda x: ", ".join(x)) + ". " +
-            self.df["tags"].apply(lambda x: ", ".join(x)) + ". " +
-            self.df["release_year"].astype(str)
+            self.df["title"].fillna("")
+            + ". "
+            + self.df["summary"]
+            + ". "
+            + self.df["genres"].apply(lambda x: ", ".join(x))
+            + ". "
+            + self.df["sub_genres"].apply(lambda x: ", ".join(x))
+            + ". "
+            + self.df["tags"].apply(lambda x: ", ".join(x))
+            + ". "
+            + self.df["release_year"].astype(str)
         )
 
     def _load_or_compute_embeddings(self):
@@ -46,7 +64,7 @@ class MovieRecommender:
                 self.df["text_for_embedding"].tolist(),
                 show_progress_bar=True,
                 convert_to_numpy=True,
-                normalize_embeddings=True
+                normalize_embeddings=True,
             )
             np.save(emb_path, self.embeddings)
 
@@ -65,10 +83,15 @@ class MovieRecommender:
         return list(zip(recommendations, scores))
 
 
-if __name__ == "__main__":
-    df = pd.read_csv("movies.csv")
-    recommender = MovieRecommender(df)
+df = pd.read_csv(os.path.join(os.path.dirname(__file__), "movies.csv"))
+recommender = MovieRecommender(df)
 
-    movie = "Schindler's List"
-    for title, score in recommender.recommend(movie, top_k=20):
-        print(f"{title:60}  Score: {score:.4f}")
+
+@app.get("/recommendation")
+def get_recommendations(title: str = Query(...), top_k: int = 10):
+    try:
+        results = recommender.recommend(title, top_k)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return [r[0] for r in results]
